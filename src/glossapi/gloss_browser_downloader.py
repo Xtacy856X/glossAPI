@@ -268,6 +268,21 @@ class BrowserGlossDownloader(GlossDownloader):
                 response_headers = {str(k): str(v) for k, v in (response.headers or {}).items()}
         return body, response_headers, {"candidate_url": url, "session_reused": True}
 
+    @staticmethod
+    def _cookie_path_matches(request_path: str, cookie_path: str) -> bool:
+        """RFC 6265 section 5.1.4 path-match.
+
+        A bare prefix match is not enough: a cookie scoped to ``/download``
+        must not ride along to ``/download-private/file.pdf``.
+        """
+        if request_path == cookie_path:
+            return True
+        if not request_path.startswith(cookie_path):
+            return False
+        if cookie_path.endswith("/"):
+            return True
+        return request_path[len(cookie_path)] == "/"
+
     def _cookie_header_for_url(self, cookies: List[Dict[str, Any]], url: str) -> str:
         """Build a Cookie header scoped to `url`'s origin.
 
@@ -301,7 +316,7 @@ class BrowserGlossDownloader(GlossDownloader):
                 # Host-only cookie: exact host match only.
                 continue
             cookie_path = str(cookie.get("path") or "/") or "/"
-            if not path.startswith(cookie_path):
+            if not self._cookie_path_matches(path, cookie_path):
                 continue
             if cookie.get("secure") and not secure:
                 continue

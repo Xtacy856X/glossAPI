@@ -299,6 +299,15 @@ def test_cookie_header_respects_cookie_path(tmp_path):
     assert downloader._cookie_header_for_url(cookies, "https://example.org/download/file.pdf") == "scoped=1"
 
 
+def test_cookie_header_path_match_requires_segment_boundary(tmp_path):
+    """RFC 6265 5.1.4: a /download cookie must not reach /download-private/..."""
+    downloader = BrowserGlossDownloader(output_dir=str(tmp_path))
+    cookies = [{"name": "scoped", "value": "1", "domain": "example.org", "path": "/download"}]
+    assert downloader._cookie_header_for_url(cookies, "https://example.org/download") == "scoped=1"
+    assert downloader._cookie_header_for_url(cookies, "https://example.org/download/file.pdf") == "scoped=1"
+    assert downloader._cookie_header_for_url(cookies, "https://example.org/download-private/file.pdf") == ""
+
+
 def test_browser_downloader_policy_routes_domain_to_browser(tmp_path, monkeypatch):
     policy = build_download_policy(
         {
