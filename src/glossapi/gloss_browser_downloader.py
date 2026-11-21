@@ -33,6 +33,22 @@ class BrowserSessionState:
     cached_at: float
 
 
+@dataclass(frozen=True)
+class BrowserCandidateResponse:
+    """A download the browser observed, plus what the browser actually sent.
+
+    ``cookie_header`` is the Cookie header of the candidate request as the
+    browser issued it. ``None`` means it could not be captured, so the caller
+    falls back to RFC 6265 matching; an empty string means the browser sent no
+    cookie at all and must be replayed as such.
+    """
+
+    url: str
+    headers: Dict[str, str]
+    file_ext: str
+    cookie_header: Optional[str] = None
+
+
 class BrowserGlossDownloader(GlossDownloader):
     """
     Downloader variant that retries browser-gated file endpoints via Playwright.
@@ -246,12 +262,13 @@ class BrowserGlossDownloader(GlossDownloader):
         url: str,
         referer: Optional[str],
         state: BrowserSessionState,
+        recorded_cookie_header: Optional[str] = None,
     ) -> Tuple[bytes, Dict[str, str], Dict[str, Any]]:
         request_headers = {
             "User-Agent": state.user_agent,
             "Accept": "application/pdf,application/octet-stream,*/*;q=0.8",
         }
-        cookie_header = self._cookie_header_for_url(state.cookies, url)
+        cookie_header = self._cookie_header_for_candidate(state.cookies, url, recorded_cookie_header)
         if cookie_header:
             request_headers["Cookie"] = cookie_header
         if referer:
@@ -267,6 +284,25 @@ class BrowserGlossDownloader(GlossDownloader):
                 received_bytes(len(body))
                 response_headers = {str(k): str(v) for k, v in (response.headers or {}).items()}
         return body, response_headers, {"candidate_url": url, "session_reused": True}
+
+    def _cookie_header_for_candidate(
+        self,
+        cookies: List[Dict[str, Any]],
+        url: str,
+        recorded_cookie_header: Optional[str],
+    ) -> str:
+        """Return the Cookie header to send when refetching `url`.
+
+        The browser already decided which cookies belong on the candidate
+        request, including its cross-origin credential policy, so the header it
+        actually sent wins whenever it was captured. Matching the context
+        cookies ourselves is only the fallback (cached sessions, engines that
+        do not expose request headers): rebuilding the header from the wider
+        context is exactly where the sibling-subdomain leak of issue #121 hid.
+        """
+        if recorded_cookie_header is not None:
+            return recorded_cookie_header
+        return self._cookie_header_for_url(cookies, url)
 
     @staticmethod
     def _cookie_path_matches(request_path: str, cookie_path: str) -> bool:
@@ -284,7 +320,7 @@ class BrowserGlossDownloader(GlossDownloader):
         return request_path[len(cookie_path)] == "/"
 
     def _cookie_header_for_url(self, cookies: List[Dict[str, Any]], url: str) -> str:
-        """Build a Cookie header scoped to `url`'s origin.
+        """Build a Cookie header scoped to `url`'s origin (fallback path).
 
         Browser bootstrap collects cookies from the whole browser context, but
         the selected candidate response may come from a different origin than
@@ -323,13 +359,33 @@ class BrowserGlossDownloader(GlossDownloader):
             matched.append(f"{name}={cookie.get('value', '')}")
         return "; ".join(matched)
 
+    @staticmethod
+    async def _cookie_header_sent_by(request: Any) -> Optional[str]:
+        """Return the Cookie header the browser really sent with `request`.
+
+        Playwright keeps context cookies out of ``request.headers`` and exposes
+        them only through ``all_headers()`` (lower-cased names). ``None`` means
+        "not captured" so the caller can fall back to matching; an empty string
+        means the browser sent no cookie and that verdict must stand.
+        """
+        try:
+            headers = await request.all_headers()
+        except Exception:
+            return None
+        if not headers:
+            return None
+        for name, value in headers.items():
+            if str(name).lower() == "cookie":
+                return str(value)
+        return ""
+
     async def _bootstrap_browser_session_state(
         self,
         *,
         url: str,
         referer: Optional[str],
         route_options: Dict[str, Any],
-    ) -> tuple[BrowserSessionState, list[tuple[str, Dict[str, str], str]]]:
+    ) -> tuple[BrowserSessionState, list[BrowserCandidateResponse]]:
         timeout_ms = int(self._route_setting(route_options, "browser_timeout_ms", self.browser_timeout_ms))
         post_load_wait_ms = int(
             self._route_setting(route_options, "browser_post_load_wait_ms", self.browser_post_load_wait_ms)
@@ -345,7 +401,7 @@ class BrowserGlossDownloader(GlossDownloader):
                 "(pip install 'glossapi[browser]'; then playwright install chromium)"
             ) from exc
 
-        accepted_responses: list[tuple[str, Dict[str, str], str]] = []
+        recorded_candidates: list[tuple[Any, Dict[str, str], str]] = []
         bootstrap_url = self._choose_browser_bootstrap_url(url)
 
         async with self.browser_bootstrap_semaphore:
@@ -382,7 +438,7 @@ class BrowserGlossDownloader(GlossDownloader):
                         response_headers = {str(k): str(v) for k, v in (response.headers or {}).items()}
                         file_ext = self.infer_file_extension(response.url, response_headers, b"")
                         if file_ext and file_ext != "html" and self.is_supported_format(file_ext):
-                            accepted_responses.append((response.url, response_headers, file_ext))
+                            recorded_candidates.append((response, response_headers, file_ext))
                     except Exception:
                         return
 
@@ -402,9 +458,19 @@ class BrowserGlossDownloader(GlossDownloader):
                         main_headers = {str(k): str(v) for k, v in (main_response.headers or {}).items()}
                         main_ext = self.infer_file_extension(main_response.url, main_headers, b"")
                         if main_ext and main_ext != "html" and self.is_supported_format(main_ext):
-                            accepted_responses.insert(0, (main_response.url, main_headers, main_ext))
-                    if not accepted_responses and post_load_wait_ms > 0:
+                            recorded_candidates.insert(0, (main_response, main_headers, main_ext))
+                    if not recorded_candidates and post_load_wait_ms > 0:
                         await page.wait_for_timeout(post_load_wait_ms)
+
+                    accepted_responses = [
+                        BrowserCandidateResponse(
+                            url=str(candidate_response.url),
+                            headers=candidate_headers,
+                            file_ext=candidate_ext,
+                            cookie_header=await self._cookie_header_sent_by(candidate_response.request),
+                        )
+                        for candidate_response, candidate_headers, candidate_ext in recorded_candidates
+                    ]
 
                     browser_user_agent = await page.evaluate("() => navigator.userAgent")
                     browser_cookies = await context.cookies()
@@ -449,11 +515,13 @@ class BrowserGlossDownloader(GlossDownloader):
                 route_options=options,
             )
             self._browser_session_cache[domain_key] = state
-            candidate_url = accepted_responses[0][0] if accepted_responses else url
+            candidate = accepted_responses[0] if accepted_responses else None
+            candidate_url = candidate.url if candidate is not None else url
             body, response_headers, meta = await self._fetch_with_browser_session_state(
                 url=candidate_url,
                 referer=referer,
                 state=state,
+                recorded_cookie_header=candidate.cookie_header if candidate is not None else None,
             )
             meta.update({
                 "candidate_url": candidate_url,

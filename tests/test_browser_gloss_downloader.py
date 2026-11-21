@@ -308,6 +308,39 @@ def test_cookie_header_path_match_requires_segment_boundary(tmp_path):
     assert downloader._cookie_header_for_url(cookies, "https://example.org/download-private/file.pdf") == ""
 
 
+def test_cookie_header_prefers_recorded_candidate_header(tmp_path):
+    """What the browser actually sent wins over re-deriving it from the context."""
+    downloader = BrowserGlossDownloader(output_dir=str(tmp_path))
+    cookies = [{"name": "shared", "value": "1", "domain": ".example.org", "path": "/"}]
+    url = "https://cdn.example.org/file.pdf"
+    # The browser sent no cookie on that cross-origin candidate: that verdict stands.
+    assert downloader._cookie_header_for_candidate(cookies, url, "") == ""
+    # A captured header is replayed verbatim.
+    assert downloader._cookie_header_for_candidate(cookies, url, "only=this") == "only=this"
+    # Nothing captured: fall back to RFC 6265 matching.
+    assert downloader._cookie_header_for_candidate(cookies, url, None) == "shared=1"
+
+
+def test_cookie_header_sent_by_reads_playwright_all_headers():
+    class _Request:
+        def __init__(self, headers=None, boom=False):
+            self._headers = headers
+            self._boom = boom
+
+        async def all_headers(self):
+            if self._boom:
+                raise RuntimeError("target closed")
+            return self._headers
+
+    capture = BrowserGlossDownloader._cookie_header_sent_by
+    assert asyncio.run(capture(_Request({"cookie": "a=b", "accept": "*/*"}))) == "a=b"
+    # Playwright exposes context cookies only through all_headers(), never request.headers.
+    assert asyncio.run(capture(_Request({"accept": "*/*"}))) == ""
+    # Unavailable means unknown, so the caller is allowed to fall back.
+    assert asyncio.run(capture(_Request(boom=True))) is None
+    assert asyncio.run(capture(_Request({}))) is None
+
+
 def test_browser_downloader_policy_routes_domain_to_browser(tmp_path, monkeypatch):
     policy = build_download_policy(
         {
